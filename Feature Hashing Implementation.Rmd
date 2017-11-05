@@ -1,0 +1,271 @@
+
+Function to check library is present, If not it will install and load in Environment 
+
+```{r results="hide"}
+usePackage <- function(p) 
+{
+  if (!is.element(p, installed.packages()[,1]))
+    install.packages(p, dep = TRUE)
+  require(p, character.only = TRUE)
+}
+```
+
+Load the required packages
+```{r results="hide",include=FALSE}
+usePackage("lubridate")
+usePackage("dplyr")
+usePackage("caret")
+usePackage("FeatureHashing")
+usePackage("glmnet")
+usePackage("ROCR")
+usePackage("pROC")
+usePackage("klaR") #package for WOE and IV
+usePackage("xgboost")
+usePackage("e1071") 
+usePackage("NbClust")
+usePackage("randomForest")
+```
+Read the data file
+
+```{r results="hide"}
+PriorAuth_Data <- read.csv("PriorAuth_Data.csv")
+str(PriorAuth_Data)
+
+```
+
+Convert the target to a factor variable
+```{r}
+PriorAuth_Data$Target <- as.factor(as.numeric(PriorAuth_Data$Target))
+```
+
+Conver date to a valid date
+```{r}
+PriorAuth_Data <- PriorAuth_Data[order(as.Date(PriorAuth_Data$TransDate,format="%m/%d/%Y")),]
+```
+
+Get the list of predictor variables
+```{r}
+predictornames <- setdiff(names(PriorAuth_Data),"Target")
+```
+
+Do a random split of the data
+```{r}
+set.seed(123456)
+split <- sample(nrow(PriorAuth_Data),floor(0.7*nrow(PriorAuth_Data)))
+PriorAuth_Data_train <- PriorAuth_Data[split,]
+PriorAuth_Data_test <- PriorAuth_Data[-split,]
+```
+
+Check the proportion of outcome to determine class imbalance if any
+```{r results="hide"}
+prop.table(table(PriorAuth_Data_train$Target))
+prop.table(table(PriorAuth_Data_test$Target))
+```
+
+#Feature Hashing
+
+```{r}
+PriorAuth_train_hashed = hashed.model.matrix(~., data=PriorAuth_Data_train[,predictornames], hash.size=2^16, transpose=FALSE)
+PriorAuth_train_hashed = as(PriorAuth_train_hashed, "dgCMatrix")
+PriorAuth_test_hashed = hashed.model.matrix(~., data=PriorAuth_Data_test[,predictornames], hash.size=2^16, transpose=FALSE)
+PriorAuth_test_hashed = as(PriorAuth_test_hashed, "dgCMatrix")
+
+```
+
+#Build model using GLMNET and feature hashing
+```{r results="hide"}
+glmnetModel <- cv.glmnet(PriorAuth_train_hashed, PriorAuth_Data_train$Target, 
+                         family = "binomial", type.measure = "auc")
+
+
+glmnetPredict <- predict(glmnetModel, PriorAuth_test_hashed, s="lambda.min")
+
+glmnetPredictfactor <- ifelse(glmnetPredict > 0.4,1,0)
+
+confusionmatrix <- table("actual" = PriorAuth_Data_test$Target, "predicted" = glmnetPredictfactor)
+accuracyglmnethash <- sum(diag(confusionmatrix))/nrow(PriorAuth_Data_test)
+recallglmnethash <- confusionmatrix[2,2]/sum(confusionmatrix[2,])
+aucglmnethash <- auc(PriorAuth_Data_test$Target,as.vector(glmnetPredictfactor))
+
+```
+
+Accuracy is 70% and recall is 88%
+
+#Build model using XGBOOST and feature hashing
+```{r results="hide"}
+output <- as.numeric(levels(PriorAuth_Data_train$Target))[PriorAuth_Data_train$Target]
+
+xgbmodel <- xgboost(PriorAuth_train_hashed, output,"objective" = "binary:logistic","max.depth"=10, "eta"=0.3,"eval_metric" = "error",
+             nround = 100, verbose = ifelse(interactive(), 1, 0))
+
+xgboostPredict <- predict(xgbmodel, PriorAuth_test_hashed)
+
+xgboostPredictfactor <- ifelse(xgboostPredict > 0.4,1,0)
+
+confusionmatrix <- table("actual" = PriorAuth_Data_test$Target, "predicted" = xgboostPredictfactor)
+accuracyxgboosthash <- sum(diag(confusionmatrix))/nrow(PriorAuth_Data_test)
+recallxgboosthash <- confusionmatrix[2,2]/sum(confusionmatrix[2,])
+
+xgboosthashauc <- auc(PriorAuth_Data_test$Target,as.vector(xgboostPredictfactor))
+
+```
+
+Accurancy for xgboost is 72 and recall is 94
+
+#Build model using SVM and feature hashing
+
+```{r results="hide"}
+svmmodel <- svm(PriorAuth_train_hashed, PriorAuth_Data_train$Target, type="C-classification", 
+                kernel = "radial", cost=1, gamma=.03, probability=TRUE)
+summary(svmmodel)
+
+svmPredict <- predict(svmmodel, PriorAuth_test_hashed,type="class", probability=TRUE)
+
+confusionmatrix <- table("actual" = PriorAuth_Data_test$Target, "predicted" = svmPredict)
+accuracysvmhash <- sum(diag(confusionmatrix))/nrow(PriorAuth_Data_test)
+recallsvmhash <- confusionmatrix[2,2]/sum(confusionmatrix[2,])
+
+svmhashauc <- auc(as.numeric(PriorAuth_Data_test$Target),as.numeric(svmPredict))
+
+```
+Accurancy SVM 72 and recall 92
+
+Do an ensemble based on majority vote
+
+```{r results="hide"}
+#Ensemble based on majority vote
+
+PriorAuth_Data_test$pred_majority <- 
+as.factor(ifelse((as.numeric(as.character(svmPredict))) == 1 &  glmnetPredictfactor == 1,1,
+ifelse(glmnetPredictfactor == 1 & (as.numeric(as.character(xgboostPredictfactor))) == 1,1,
+ifelse((as.numeric(as.character(svmPredict))) == 1 & (as.numeric(as.character(xgboostPredictfactor))) == 1,1,0))))
+
+confusionmatrix <- table("actual" = PriorAuth_Data_test$Target, "predicted" = PriorAuth_Data_test$pred_majority)
+accuracymajority <- sum(diag(confusionmatrix))/nrow(PriorAuth_Data_test)
+recallmajorit <- confusionmatrix[2,2]/sum(confusionmatrix[2,])
+
+```
+Accuracy using majority vote ensemble is 73 and recall is 95
+
+#Feature engineering by clustering
+### Considering there are a lot of levels in the data, perform bivariate analysis and look at ways to reduce the levels
+### For each variable identify the frequency of occurence and frequency of prior authorization required
+
+Create new variables - the column frequency and response rate for each feature 
+
+```{r results="hide"}
+PriorAuth_Data1 <- PriorAuth_Data
+PriorAuth_Data1$TransDate <- NULL
+for (var in 0:13)
+    {
+    print(colnames(PriorAuth_Data1[,var]))
+    columnname <- colnames(PriorAuth_Data1[,var])
+    groupfreq <- paste(columnname,".freq")
+    groupresp <- paste(columnname,".resprate")
+    PriorAuth_Data1 <- PriorAuth_Data1 %>% group_by(UserID) %>% mutate(!!groupfreq := n(),!!groupresp := sum(Target == 1))
+    print(names(PriorAuth_Data1))
+    
+    }
+PriorAuth_Data1$` .freq` <- NULL
+PriorAuth_Data1$` .resprate` <- NULL
+
+
+```
+
+Cluster the data - determine optimum number of clusters using Nbclust package, rather than manually determining the optimum number of clusters using elbow plot
+
+Create a k means cluster model
+
+```{r results="hide"}
+get_cluster_IDs <- function(data, no_of_clusters)
+{
+  kmeans_fit <- kmeans(data[1:2], no_of_clusters)
+  return (kmeans_fit$cluster)
+}
+
+```
+
+```{r results="hide"}
+for (var in 1:13)
+ {
+  rowname <- colnames(PriorAuth_Data1[,var])
+  freqcol <- paste(colnames(PriorAuth_Data1[,var]),".freq")
+  respratecol <- paste(colnames(PriorAuth_Data1[,var]),".resprate")                 
+  data <-  PriorAuth_Data1[,c(freqcol,respratecol)] 
+  split <- sample(nrow(data),floor(0.1*nrow(data)))
+  data1 <- data[split,]
+  
+  res<-NbClust(data1, diss=NULL, distance = "euclidean", min.nc=2, max.nc=10,
+               method = "kmeans", index = "all")
+  optimumclust <- length(unique(res$Best.partition))
+  
+  
+  
+  newvar <- paste0("new",rowname)
+  
+  Newclusterid <- get_cluster_IDs(data, optimumclust)
+  Newclusterid <- data.frame(matrix(Newclusterid, ncol = 1))
+  mutate(PriorAuth_Data1,!!newvar := n())
+  PriorAuth_Data1[,c(newvar)] <- Newclusterid
+}
+
+processeddata <- subset(PriorAuth_Data1,select = c(newUserID:newState))
+processeddata <- cbind(processeddata, Target=PriorAuth_Data$Target)
+
+
+```
+
+Select the important variables using rf model
+
+```{r results="hide"}
+set.seed(12345)
+rf_model <- randomForest(Target~., processeddata, ntree = 100, keep.forest=T, importance=TRUE)
+summary(rf_model)
+rf_model$importance
+
+round(importance(rf_model), 2)
+
+rf_imp_attr = data.frame(rf_model$importance)
+rf_imp_attr = data.frame(row.names(rf_imp_attr), rf_imp_attr[,1])
+colnames(rf_imp_attr) = c('Attributes', 'Importance')
+rf_imp_attr = rf_imp_attr[order(rf_imp_attr$Importance, decreasing = TRUE),]
+
+#varImpPlot(rf_model)
+important_vars <- 5
+top_imp_attr = as.character(rf_imp_attr$Attributes[1:important_vars])
+newDataSet <- subset(processeddata, select= c(top_imp_attr))
+newDataSet$Target <- processeddata$Target
+
+```
+
+
+Randomly split data and create a logistic regression model
+
+
+```{r results="hide"}
+set.seed(12345)
+split <- sample(nrow(newDataSet),floor(0.7*nrow(newDataSet)))
+
+PriorAuth_Data_train <-newDataSet[split,]
+PriorAuth_Data_test<-newDataSet[-split,]
+
+predictornames <- setdiff(names(newDataSet),"Target")
+
+glmmodel <- glm(Target ~ ., data=PriorAuth_Data_train, family=binomial)
+
+glmpredict <- predict(glmmodel, PriorAuth_Data_test[,predictornames], type="response")
+
+glmpredictfactor <- factor(ifelse(glmpredict > 0.4, 1, 0))
+confusionmatrix = table("actual"= PriorAuth_Data_test$Target, "predicted" = glmpredict);
+accuracyglm= sum(diag(confusionmatrix))/sum(confusionmatrix)
+recallglm =confusionmatrix[2,2]/sum(confusionmatrix[2,])
+
+```
+
+
+
+
+
+
+
+
